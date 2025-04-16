@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
@@ -6,16 +5,16 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 def run_optimization(df):
-    # ✅ Ensure Manual Load is numeric and filled
+    # Ensure Manual Load is numeric
     df["Manual Load"] = pd.to_numeric(df["Manual Load"], errors="coerce").fillna(0)
 
-    # ➕ Calculate used space from manual input
+    # Pre-calculate used volume/weight from manual loads
     df["Used Volume"] = df["Manual Load"] * df["Volume (cbm)"]
     df["Used Weight"] = df["Manual Load"] * df["Weight (kg)"]
     used_volume_total = df["Used Volume"].sum()
     used_weight_total = df["Used Weight"].sum()
 
-    # 🔁 Generate synthetic training data for ML
+    # Simulate training data for ML
     simulated_data = []
     np.random.seed(42)
     for _ in range(1000):
@@ -47,7 +46,7 @@ def run_optimization(df):
         "MOQ", "Safety Stock", "ROP", "Priority Score", "Cartons"
     ])
 
-    # ⚙️ Train Random Forest Regressor
+    # Train model
     X = sim_df.drop(columns=["Cartons"])
     y = sim_df["Cartons"]
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -57,7 +56,7 @@ def run_optimization(df):
     model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(X_train_scaled, y_train)
 
-    # 🚚 Hybrid fill for 100% container utilization
+    # Fill logic
     def hybrid_fill_full(container_name, max_volume, max_weight):
         remaining_volume = max_volume - used_volume_total
         remaining_weight = max_weight - used_weight_total
@@ -99,13 +98,13 @@ def run_optimization(df):
                     "Used Weight": round(max_possible * row["Weight (kg)"], 2)
                 })
 
-        # ✅ Fix: Check for empty predictions
         pred_df = pd.DataFrame(predictions)
         if pred_df.empty:
             return container_name, 0, 0, pd.DataFrame()
 
         pred_df = pred_df.sort_values(by="Used Volume").reset_index(drop=True)
-        final_selection, vol_accum, wt_accum = [], 0, 0
+        final_selection = []
+        vol_accum, wt_accum = 0, 0
 
         for _, row in pred_df.iterrows():
             if vol_accum + row["Used Volume"] <= remaining_volume and wt_accum + row["Used Weight"] <= remaining_weight:
@@ -113,15 +112,27 @@ def run_optimization(df):
                 vol_accum += row["Used Volume"]
                 wt_accum += row["Used Weight"]
             else:
-                break
+                remaining_vol = remaining_volume - vol_accum
+                remaining_wt = remaining_weight - wt_accum
+                max_qty_by_vol = int(remaining_vol // (row["Used Volume"] / row["Predicted Qty"]))
+                max_qty_by_wt = int(remaining_wt // (row["Used Weight"] / row["Predicted Qty"]))
+                trim_qty = min(max_qty_by_vol, max_qty_by_wt)
+                if trim_qty >= df[df["SKU Code"] == row["SKU"]]["MOQ"].values[0]:
+                    trimmed_row = row.copy()
+                    trimmed_row["Predicted Qty"] = trim_qty
+                    trimmed_row["Used Volume"] = round(trim_qty * (row["Used Volume"] / row["Predicted Qty"]), 3)
+                    trimmed_row["Used Weight"] = round(trim_qty * (row["Used Weight"] / row["Predicted Qty"]), 2)
+                    final_selection.append(trimmed_row)
+                    vol_accum += trimmed_row["Used Volume"]
+                    wt_accum += trimmed_row["Used Weight"]
+                continue
 
         return container_name, vol_accum, wt_accum, pd.DataFrame(final_selection)
 
-    # 📦 Run for both container types
+    # Run for both containers
     result_20ft = hybrid_fill_full("20ft", 33, 28080)
     result_40ft = hybrid_fill_full("40ft", 67, 26700)
 
-    # 🧮 Calculate fill scores
     fill_20ft_vol = result_20ft[1] / 33
     fill_20ft_wt = result_20ft[2] / 28080
     fill_40ft_vol = result_40ft[1] / 67
@@ -130,10 +141,9 @@ def run_optimization(df):
     score_20ft = max(fill_20ft_vol, fill_20ft_wt)
     score_40ft = max(fill_40ft_vol, fill_40ft_wt)
 
-    # 🥇 Pick best result
     best_result = result_40ft if score_40ft >= score_20ft else result_20ft
 
-    # ➕ Add manual load to output
+    # Combine with manual loads
     manual_df = df[df["Manual Load"] > 0][["SKU Code", "Manual Load"]].copy()
     manual_df.columns = ["SKU", "Predicted Qty"]
     manual_df["Used Volume"] = manual_df["SKU"].map(df.set_index("SKU Code")["Volume (cbm)"]) * manual_df["Predicted Qty"]
@@ -141,6 +151,8 @@ def run_optimization(df):
     manual_df["Container Type"] = best_result[0]
 
     final_df = pd.concat([manual_df, best_result[3]], ignore_index=True)
+    total_volume = final_df["Used Volume"].sum()
+    total_weight = final_df["Used Weight"].sum()
 
     summary_df = pd.DataFrame({
         "Metric": ["Volume Fill %", "Weight Fill %"],
